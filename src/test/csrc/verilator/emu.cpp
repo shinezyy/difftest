@@ -129,13 +129,6 @@ Emulator::Emulator(int argc, const char *argv[]):
   // init ram
   init_ram(args.image);
 
-  difftest_init();
-  init_device();
-  if (args.enable_diff) {
-    init_goldenmem();
-    init_nemuproxy();
-  }
-
 #if VM_TRACE == 1
 #ifndef EN_FORKWAIT
   enable_waveform = args.enable_waveform;
@@ -159,8 +152,7 @@ Emulator::Emulator(int argc, const char *argv[]):
   if (args.snapshot_path != NULL) {
     printf("loading from snapshot `%s`...\n", args.snapshot_path);
     snapshot_load(args.snapshot_path);
-    auto cycleCnt = difftest[0]->get_trap_event()->cycleCnt;
-    printf("model cycleCnt = %" PRIu64 "\n", cycleCnt);
+    printf("model cycleCnt = %" PRIu64 "\n", dut_ptr->io_trap_cycleCnt);
   }
 #endif
 
@@ -236,18 +228,29 @@ inline void Emulator::single_cycle() {
     extern uint8_t uart_getc();
     dut_ptr->io_uart_in_ch = uart_getc();
   }
-
-  cycles++;
+  cycles ++;
 }
 
 uint64_t Emulator::execute(uint64_t max_cycle, uint64_t max_instr) {
 
-  uint32_t t = uptime();
+  difftest_init();
+  init_device();
+  if (args.enable_diff) {
+    init_goldenmem();
+    init_nemuproxy();
+  }
+
   uint32_t lasttime_poll = 0;
   uint32_t lasttime_snapshot = 0;
   uint64_t core_max_instr[NUM_CORES];
   for (int i = 0; i < NUM_CORES; i++) {
     core_max_instr[i] = max_instr;
+  }
+
+  uint32_t t = uptime();
+  if (t - lasttime_poll > 100) {
+    poll_event();
+    lasttime_poll = t;
   }
 
 #ifdef EN_FORKWAIT
@@ -286,13 +289,6 @@ uint64_t Emulator::execute(uint64_t max_cycle, uint64_t max_instr) {
 #endif
 
   while (!Verilated::gotFinish() && trapCode == STATE_RUNNING) {
-    t = uptime();
-
-    if (t - lasttime_poll > 100) {
-      poll_event();
-      lasttime_poll = t;
-    }
-
     // cycle limitation
     if (!max_cycle) {
       trapCode = STATE_LIMIT_EXCEEDED;
@@ -352,6 +348,7 @@ uint64_t Emulator::execute(uint64_t max_cycle, uint64_t max_instr) {
 #ifdef VM_SAVABLE
     static int snapshot_count = 0;
     if (args.enable_snapshot && trapCode != STATE_GOODTRAP && t - lasttime_snapshot > 1000 * SNAPSHOT_INTERVAL) {
+      // save snapshot every 60s
       time_t now = time(NULL);
       snapshot_save(snapshot_filename(now));
       lasttime_snapshot = t;
@@ -553,12 +550,6 @@ void ForkShareMemory::shwait() {
 #endif
 
 #ifdef VM_SAVABLE
-
-// currently only support single core snapshot
-#if NUM_CORES != 1
-  #error "unsupported multicore"
-#endif
-
 void Emulator::snapshot_save(const char *filename) {
   static int last_slot = 0;
   VerilatedSaveMem &stream = snapshot_slot[last_slot];
@@ -572,27 +563,24 @@ void Emulator::snapshot_save(const char *filename) {
   stream.unbuf_write(&size, sizeof(size));
   stream.unbuf_write(get_ram_start(), size);
 
-  auto diff = difftest[0];
-  uint64_t cycleCnt = diff->get_trap_event()->cycleCnt;
-  stream.unbuf_write(&cycleCnt, sizeof(cycleCnt));
-
-  auto proxy = diff->proxy;
-
   uint64_t ref_r[DIFFTEST_NR_REG];
-  proxy->regcpy(&ref_r, REF_TO_DUT);
+  ref_difftest_getregs(&ref_r, 0);
   stream.unbuf_write(ref_r, sizeof(ref_r));
 
+  uint64_t nemu_this_pc = get_nemu_this_pc(0);
+  stream.unbuf_write(&nemu_this_pc, sizeof(nemu_this_pc));
+
   char *buf = (char *)mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
-  proxy->memcpy(0x80000000, buf, size, DIFFTEST_TO_DUT);
+  ref_difftest_memcpy(buf, 0x80000000, size, 0, DIFFTEST_TO_DUT);
   stream.unbuf_write(buf, size);
   munmap(buf, size);
 
   struct SyncState sync_mastate;
-  proxy->uarchstatus_cpy(&sync_mastate, REF_TO_DUT);
+  ref_difftest_get_mastatus(&sync_mastate, 0);
   stream.unbuf_write(&sync_mastate, sizeof(struct SyncState));
 
   uint64_t csr_buf[4096];
-  proxy->csrcpy(csr_buf, REF_TO_DIFFTEST);
+  ref_difftest_get_csr(csr_buf, 0);
   stream.unbuf_write(&csr_buf, sizeof(csr_buf));
 
   long sdcard_offset;
@@ -615,28 +603,26 @@ void Emulator::snapshot_load(const char *filename) {
   assert(size == get_ram_size());
   stream.read(get_ram_start(), size);
 
-  auto diff = difftest[0];
-  uint64_t *cycleCnt = &(diff->get_trap_event()->cycleCnt);
-  stream.read(cycleCnt, sizeof(*cycleCnt));
-
-  auto proxy = diff->proxy;
-
   uint64_t ref_r[DIFFTEST_NR_REG];
   stream.read(ref_r, sizeof(ref_r));
-  proxy->regcpy(&ref_r, DUT_TO_REF);
+  ref_difftest_setregs(&ref_r, 0);
+
+  uint64_t nemu_this_pc;
+  stream.read(&nemu_this_pc, sizeof(nemu_this_pc));
+  set_nemu_this_pc(nemu_this_pc, 0);
 
   char *buf = (char *)mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
   stream.read(buf, size);
-  proxy->memcpy(0x80000000, buf, size, DIFFTEST_TO_REF);
+  ref_difftest_memcpy(0x80000000, buf, size, 0, DIFFTEST_TO_REF);
   munmap(buf, size);
 
   struct SyncState sync_mastate;
   stream.read(&sync_mastate, sizeof(struct SyncState));
-  proxy->uarchstatus_cpy(&sync_mastate, DUT_TO_REF);
+  ref_difftest_set_mastatus(&sync_mastate, 0);
 
   uint64_t csr_buf[4096];
   stream.read(&csr_buf, sizeof(csr_buf));
-  proxy->csrcpy(csr_buf, DIFFTEST_TO_REF);
+  ref_difftest_set_csr(csr_buf, 0);
 
   long sdcard_offset = 0;
   stream.read(&sdcard_offset, sizeof(sdcard_offset));

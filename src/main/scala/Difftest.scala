@@ -18,6 +18,7 @@ package difftest
 
 import chisel3._
 import chisel3.util._
+import Chisel.BlackBox
 
 trait DifftestParameter {
 }
@@ -43,6 +44,7 @@ class DiffArchEventIO extends DifftestBundle {
   val intrNO = Input(UInt(32.W))
   val cause = Input(UInt(32.W))
   val exceptionPC = Input(UInt(64.W))
+  val exceptionInst = Input(UInt(32.W))
 }
 
 class DiffInstrCommitIO extends DifftestBundle with DifftestWithIndex {
